@@ -37,14 +37,7 @@ trade_df = pd.read_excel(
 
 
 # 时间格式统一
-
-period_df["开始时间"] = (
-    pd.to_datetime(
-        period_df["开始时间"].astype(str)
-    )
-    .dt.strftime("%H:%M")
-)
-
+# period_df 的 "时点" 列已是 "HH:MM" 字符串，无需转换
 
 trade_df["时间"] = (
     pd.to_datetime(
@@ -74,7 +67,9 @@ price_type = st.sidebar.selectbox(
     "计价方式",
     [
         "单一制",
-        "两部制"
+        "两部制（一般）",
+        "两部制（大工业）",
+
     ]
 )
 
@@ -103,14 +98,21 @@ gu = st.sidebar.number_input(
     min_value=0.0
 )
 
-
+shengu = st.sidebar.number_input(
+    "深谷电量(kWh)",
+    min_value=0.0
+)
 
 total_energy = (
     jianfeng+
     feng+
     ping+
-    gu
+    gu+
+    shengu
 )
+
+# 保存用户输入的月度总电量，用于中长期合约电量计算
+input_total_energy = total_energy
 
 
 
@@ -178,102 +180,82 @@ work_times = get_work_time(
 
 
 # ============================
-# 生成96点负荷
+# 构建日×时点负荷表
 # ============================
 
+# 从 time.xlsx 获取当月每日每时点的峰谷类型
+month_period = period_df[period_df["月"] == month].copy()
+month_period["类型"] = month_period[price_type]
 
-load = pd.DataFrame(
-    {
-        "时间":time_list
-    }
-)
+# 统一类型标签：time.xlsx 使用 "平段"，代码使用 "平"
+month_period["类型"] = month_period["类型"].replace({"平段": "平"})
 
+# 获取当月天数（从 time.xlsx 取天数，与 Tradingdata 一致）
+days_in_month = sorted(month_period["日"].unique())
+n_days = len(days_in_month)
 
+# 构建完整的日×时点负荷表
+load_rows = []
+for day in days_in_month:
+    day_data = month_period[month_period["日"] == day]
+    for t in time_list:
+        match = day_data[day_data["时点"] == t]
+        if len(match) > 0:
+            ptype = match["类型"].iloc[0]
+        else:
+            # 兜底：若某时点缺失，默认设为 "平"
+            ptype = "平"
+        load_rows.append({"日": int(day), "时间": t, "类型": ptype})
 
-# 匹配峰谷类型
-
-period = period_df[
-    (period_df["月份"]==month)
-    &
-    (period_df["计价方式"]==price_type)
-]
-
-
-load = load.merge(
-    period[
-        [
-            "开始时间",
-            "峰谷类型"
-        ]
-    ],
-    left_on="时间",
-    right_on="开始时间",
-    how="left"
-)
-
-
-load.rename(
-    columns={
-        "峰谷类型":"类型"
-    },
-    inplace=True
-)
-
+load = pd.DataFrame(load_rows)
 
 
 # ============================
 # 分配尖峰平谷电量
 # ============================
 
-
-energy_dict={
-
-    "尖峰":
-    jianfeng,
-
-    "高峰":
-    feng,
-
-    "平":
-    ping,
-
-    "低谷":
-    gu
+energy_dict = {
+    "尖峰": jianfeng,
+    "高峰": feng,
+    "平": ping,
+    "低谷": gu,
+    "深谷": shengu
 }
 
+load["电量"] = 0.0
 
-
-load["电量"]=0.0
-
-
-
-for p,e in energy_dict.items():
-
-
-    count = len(
-        load[
-            (load["时间"].isin(work_times))
-            &
-            (load["类型"]==p)
-        ]
+for p, e in energy_dict.items():
+    mask = (
+        load["时间"].isin(work_times)
+        & (load["类型"] == p)
     )
+    count = mask.sum()
+    if count > 0:
+        avg = e / count
+        load.loc[mask, "电量"] = avg
 
+# 更新总用电量为实际分配到各时点的电量之和
+# （某些类型可能在选定工作时段内不存在，输入电量不会全部被分配）
+total_energy = load["电量"].sum()
 
-    if count>0:
+# 提示未分配的电量
+unassigned = {}
+for p, e in energy_dict.items():
+    mask = (
+        load["时间"].isin(work_times)
+        & (load["类型"] == p)
+    )
+    if mask.sum() == 0 and e > 0:
+        unassigned[p] = e
 
-        avg=e/count
-
-
-        load.loc[
-            (
-                load["时间"].isin(work_times)
-            )
-            &
-            (
-                load["类型"]==p
-            ),
-            "电量"
-        ]=avg
+if unassigned:
+    unassigned_list = "、".join(
+        [f"{p}({v:.0f}kWh)" for p, v in unassigned.items()]
+    )
+    st.sidebar.warning(
+        f"⚠️ 以下类型在选定工作时段内没有对应时段，"
+        f"电量未被分配：{unassigned_list}"
+    )
 
 
 
@@ -283,13 +265,14 @@ for p,e in energy_dict.items():
 
 
 st.subheader(
-    "用户96点分时电量"
+    "用户96点分时电量（按日展开）"
 )
 
 
 st.dataframe(
     load[
         [
+            "日",
             "时间",
             "类型",
             "电量"
@@ -301,33 +284,29 @@ st.dataframe(
 
 
 # ============================
-# 匹配交易数据（按日计算）
+# 匹配交易数据（按日匹配）
 # ============================
 
 
-# 筛选当月交易数据
+# 筛选当月交易数据，提取日期中的"日"用于匹配
 trade_month = (
     trade_df[
-        trade_df["月份"]==month
+        trade_df["月份"] == month
     ]
     .copy()
 )
 
-# 当月天数
-n_days = trade_month["日期"].nunique()
+trade_month["日"] = trade_month["日期"].dt.day
 
-# 月度96点电量均分到每日
-load["日电量"] = load["电量"] / n_days
-
-# 合并每日负荷与每日交易数据（按时间展开到日）
-result = load[[
-    "时间","类型","电量","日电量"
-]].merge(
-    trade_month[[
-        "日期","时间",
-        "中长期曲线","中长期均价","现货均价"
-    ]],
-    on="时间",
+# 按 (日, 时间) 合并负荷与交易数据
+result = load.merge(
+    trade_month[
+        [
+            "日", "时间",
+            "中长期曲线", "中长期均价", "现货均价"
+        ]
+    ],
+    on=["日", "时间"],
     how="left"
 )
 
@@ -337,17 +316,16 @@ result = load[[
 # 中长期电量（每日每点计算）
 # ============================
 
-
-# 中长期电量 = (总电量/天数) * 0.8 * 每日中长期曲线
+# 中长期电量 = 月度总用电量 × 80% × 中长期曲线（每点曲线值直接使用，不汇总）
 result["中长期电量"] = (
-    (total_energy)
+    input_total_energy
     * 0.8
     * result["中长期曲线"]
 )
 
-# 现货电量 = 日电量 - 中长期电量
+# 现货电量 = 每点实际电量 - 每点中长期电量（负值=向现货市场售出多余合约电量）
 result["现货电量"] = (
-    result["日电量"]
+    result["电量"]
     -
     result["中长期电量"]
 )
